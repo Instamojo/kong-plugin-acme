@@ -15,15 +15,15 @@ return {
   },
 
   acme_domain = {
-    ttl = true,
     primary_key = { "id" },
-    cache_key = { "domain" },
+    cache_key = { "name" },
+    endpoint_key = "name",
     generate_admin_api = true,
     admin_api_name = "acme-domains",
     name = "acme_domain",
     fields = {
       { id = typedefs.uuid },
-      { domain = { type = "string", required = true, unique = true }, },
+      { name = { type = "string", required = true, unique = true }, },
       { created_at = typedefs.auto_timestamp_s },
     },
   },

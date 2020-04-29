@@ -89,15 +89,26 @@ local function get_allowed_config_domains(host)
 end
 
 
+local function load_domain(domain)
+  kong.log.warn("Loading domain from DB ", domain)
+  local entity, err = kong.db.acme_domain:select_by_name(domain)
+  if not entity then
+    return nil, err
+  end
+  return entity
+end
+
+
 local function is_domain_db_config_exists(host)
   local allowed_domains = get_allowed_config_domains(host)
   for _, domain in ipairs(allowed_domains) do
     kong.log.warn("checking domain " .. domain .. " in DB")
-    local entity, err = kong.db.acme_domain:select_by_name(domain)
+    local domain_cache_key = kong.db.acme_domain:cache_key(domain)
+    local entity, err = kong.cache:get(domain_cache_key, nil, load_domain, domain)
 
     if err then
-      kong.log.warn("can't load domain from storage: ", err)
-      return false
+      kong.log.err("can't load domain from storage: ", err)
+      return kong.response.exit(500, { message = "Unexpected error" })
     end
 
     if entity then
@@ -106,6 +117,7 @@ local function is_domain_db_config_exists(host)
     end
   end
 
+  -- no domain in cache nor datastore
   return false
 end
 

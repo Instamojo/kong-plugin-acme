@@ -48,6 +48,68 @@ local function build_domain_matcher(domains)
   })
 end
 
+
+local function get_allowed_config_domains(host)
+  local domains = {}
+  local t = ngx.re.match(host, "(?:(.+)[.])*([^.]+[.][^.]+)$", "jo")
+
+  -- Root domain wildcard pattern
+  local root = t[table.maxn(t)]
+  table.insert(domains, "*." .. root)
+
+  local it, err = ngx.re.gmatch(t[1], "([^.]+)", "i")
+  local subs = {}
+  while true do
+    local m, err = it()
+    if not m then
+      break
+    end
+
+    if not err then
+      table.insert(subs, m[0])
+    end
+  end
+
+  local prev = root
+  for i=1, #subs do
+    local index = #subs + 1 - i
+    local new_domain = subs[index] .. "." .. prev
+
+    if index == 1 then
+      table.insert(domains, new_domain)
+
+    else
+      table.insert(domains, "*." .. new_domain)
+    end
+
+    prev = new_domain
+  end
+
+  return domains
+end
+
+
+local function is_domain_db_config_exists(host)
+  local allowed_domains = get_allowed_config_domains(host)
+  for _, domain in ipairs(allowed_domains) do
+    kong.log.warn("checking domain " .. domain .. " in DB")
+    local entity, err = kong.db.acme_domain:select_by_name(domain)
+
+    if err then
+      kong.log.warn("can't load domain from storage: ", err)
+      return false
+    end
+
+    if entity then
+      kong.log.warn("config exists for domain: ", domain)
+      return true
+    end
+  end
+
+  return false
+end
+
+
 function LetsencryptHandler:init_worker()
   local worker_id = ngx.worker.id()
   kong.log.info("acme renew timer started on worker ", worker_id)
@@ -65,10 +127,16 @@ function LetsencryptHandler:certificate(conf)
     return
   end
 
-  -- TODO: cache me
-  build_domain_matcher(conf.domains)
-  if not domains_matcher or not domains_matcher[host] then
-    kong.log.debug("ignoring because domain is not in whitelist")
+  if not conf.domains_in_db then
+    -- TODO: cache me
+    build_domain_matcher(conf.domains)
+    if not domains_matcher or not domains_matcher[host] then
+      kong.log.debug("ignoring because domain is not in whitelist")
+      return
+    end
+
+  elseif not is_domain_db_config_exists(host) then
+    kong.log.warn("ignoring because domain is not in DB whitelist : ", host)
     return
   end
 
@@ -141,8 +209,13 @@ function LetsencryptHandler:access(conf)
       return
     end
 
-    build_domain_matcher(conf.domains)
-    if not domains_matcher or not domains_matcher[kong.request.get_host()] then
+    if not conf.domains_in_db then
+      build_domain_matcher(conf.domains)
+      if not domains_matcher or not domains_matcher[kong.request.get_host()] then
+        return
+      end
+
+    elseif not is_domain_db_config_exists(host) then
       return
     end
 

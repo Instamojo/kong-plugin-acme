@@ -65,6 +65,10 @@ local schema = {
           type = "number",
           default = 14,
         }, },
+        { domains_in_db = {
+          type = "boolean",
+          default = false,
+        } },
         { domains = typedefs.hosts },
         { storage = {
           type = "string",

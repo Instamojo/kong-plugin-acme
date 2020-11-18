@@ -16,7 +16,7 @@ local LetsencryptHandler = {}
 -- otherwise acme-challenges endpoints may be blocked by auth plugins
 -- causing validation failures
 LetsencryptHandler.PRIORITY = 1007
-LetsencryptHandler.VERSION = "0.2.10"
+LetsencryptHandler.VERSION = "0.2.12"
 
 local function build_domain_matcher(domains)
   local domains_plain = {}
@@ -145,6 +145,8 @@ function LetsencryptHandler:certificate(conf)
     return
   end
 
+  host = string.lower(host)
+
   if not conf.domains_in_db then
     -- TODO: cache me
     build_domain_matcher(conf.domains)
@@ -176,7 +178,7 @@ function LetsencryptHandler:certificate(conf)
     return
   end
 
-  local certkey, err = client.load_certkey(conf, host)
+  local certkey, err = client.load_certkey_cached(conf, host)
   if err then
     kong.log.warn("can't load cert and key from storage: ", err)
     return
@@ -185,20 +187,24 @@ function LetsencryptHandler:certificate(conf)
   -- cert not found, get a new one and serve default cert for now
   if not certkey then
     ngx.timer.at(0, function()
-      local err = client.update_certificate(conf, host, nil)
+      local ok, err = client.update_certificate(conf, host, nil)
       if err then
         kong.log.err("failed to update certificate: ", err)
         return
       end
-      err = client.store_renew_config(conf, host)
-      if err then
-        kong.log.err("failed to store renew config: ", err)
-        return
+      -- if not ok and err is nil, meaning the update is running by another worker
+      if ok then
+        err = client.store_renew_config(conf, host)
+        if err then
+          kong.log.err("failed to store renew config: ", err)
+          return
+        end
       end
     end)
     return
   end
 
+  -- this will only be run in dbless
   kong.log.debug("set certificate for host: ", host)
   local _, err
   _, err = ngx_ssl.clear_certs()

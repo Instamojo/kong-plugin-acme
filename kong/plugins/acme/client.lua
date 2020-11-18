@@ -12,6 +12,7 @@ local RENEW_LAST_RUN_KEY = "kong_acme:renew_last_run"
 local CERTKEY_KEY_PREFIX = "kong_acme:cert_key:"
 
 local LOCK_TIMEOUT = 30 -- in seconds
+local CACHE_TTL = 3600 -- in seconds
 
 local function account_name(conf)
   return "kong_acme:account:" .. conf.api_uri .. ":" ..
@@ -26,11 +27,34 @@ local function deserialize_account(j)
   return j
 end
 
+local function deserialize_certkey(j)
+  local certkey = cjson.decode(j)
+  if not certkey.key or not certkey.key then
+    return nil, "key or cert found in storage"
+  end
+
+  local cert, err = ngx_ssl.cert_pem_to_der(certkey.cert)
+  if err then
+    return nil, err
+  end
+  local key, err = ngx_ssl.priv_key_pem_to_der(certkey.key)
+  if err then
+    return nil, err
+  end
+  return {
+    key = key,
+    cert = cert,
+  }
+end
+
 local function cached_get(storage, key, deserializer, ttl, neg_ttl)
   local cache_key = kong.db.acme_storage:cache_key(key)
   return kong.cache:get(cache_key, {
     l1_serializer = deserializer,
-    ttl = ttl,
+    -- in dbless mode, kong.cache has mlcache set to 0 as ttl
+    -- we override the default setting here so that cert can be invalidated
+    -- with renewal.
+    ttl = math.max(ttl or CACHE_TTL, 0),
     neg_ttl = neg_ttl,
   }, storage.get, storage, key)
 end
@@ -38,11 +62,11 @@ end
 local function new_storage_adapter(conf)
   local storage = conf.storage
   if not storage then
-    return nil, "storage is nil"
+    return nil, nil, "storage is nil"
   end
   local storage_config = conf.storage_config[storage]
   if not storage_config then
-    return nil, storage .. " is not defined in plugin storage config"
+    return nil, nil, storage .. " is not defined in plugin storage config"
   end
   if storage == "kong" then
     storage = "kong.plugins.acme.storage.kong"
@@ -115,8 +139,8 @@ local function order(acme_client, host, key, cert_type)
   return cert, key, nil
 end
 
--- idempotent routine for updating sni and certificate in kong db
-local function save(host, key, cert)
+-- idempotent routine for updating sni and certificate in Kong database
+local function save_dao(host, key, cert)
   local cert_entity, err = kong.db.certificates:insert({
     cert = cert,
     key = key,
@@ -199,16 +223,28 @@ end
 local function update_certificate(conf, host, key)
   local _, st, err = new_storage_adapter(conf)
   if err then
-    kong.log.err("can't create storage adapter: ", err)
-    return
+    return false, "can't create storage adapter: " .. err
   end
+
+  local backoff_key = "kong_acme:fail_backoff:" .. host
+  local backoff_until, err = st:get(backoff_key)
+  if err then
+    kong.log.warn("failed to read backoff status for ", host, " : ", err)
+  end
+  if backoff_until and tonumber(backoff_until) then
+    local wait = tonumber(backoff_until) - ngx.time()
+    return false, "please try again in " .. wait .. " seconds for host " ..
+            host .. " because of previous failure; this is configurable " ..
+            "with config.fail_backoff_minutes"
+  end
+
   local lock_key = "kong_acme:update_lock:" .. host
   -- TODO: wait longer?
   -- This goes to the backend storage and may bring pressure, add a first pass shm cache?
   local err = st:add(lock_key, "placeholder", LOCK_TIMEOUT)
   if err then
     kong.log.info("update_certificate for ", host, " is already running: ", err)
-    return
+    return false
   end
   local acme_client, cert, err
   err = create_account(conf)
@@ -227,86 +263,93 @@ local function update_certificate(conf, host, key)
       -- cached cert/key in other node, we set the cache to be same as
       -- lock timeout, so that multiple node will not try to update certificate
       -- at the same time because they are all seeing default cert is served
-      return st:set(CERTKEY_KEY_PREFIX .. host, cjson.encode({
+      local err = st:set(CERTKEY_KEY_PREFIX .. host, cjson.encode({
         key = key,
         cert = cert,
       }))
+      return true, err
     else
-      err = save(host, key, cert)
+      err = save_dao(host, key, cert)
     end
   end
 ::update_certificate_error::
+  local wait_seconds = conf.fail_backoff_minutes * 60
+  local err_set = st:set(backoff_key, string.format("%d", ngx.time() + wait_seconds), wait_seconds)
+  if err_set then
+    kong.log.warn("failed to set fallback key for ", host, ": ", err_set)
+  end
+
   local err_del = st:delete(lock_key)
   if err_del then
     kong.log.warn("failed to delete update_certificate lock for ", host, ": ", err_del)
   end
-  return err
+  return true, err
 end
 
--- returns key, if_renew, if_cleanup_renew_conf, err
-local function check_expire_dbless(st, host, threshold)
-  local certkey, err = st:get(CERTKEY_KEY_PREFIX .. host)
-  -- generally, we want to skip the current renewal if we can't verify if
-  -- the cert not needed anymore. and delete the renew conf if we do see the
-  -- cert is deleted
-  if err then
-    return nil, false, false, "can't read certificate from storage"
-  elseif not certkey then
-    kong.log.warn("certificate for host ", host, " is deleted from storage, deleting renew config")
-    return nil, false, true
-  end
-  certkey = cjson.decode(certkey)
-  local key = certkey and certkey.key
-
-  local crt, err = x509.new(certkey.cert)
+local function check_expire(cert, threshold)
+  local crt, err = x509.new(cert)
   if err then
     kong.log.info("can't parse cert stored in storage: ", err)
   elseif crt:get_not_after() - threshold > ngx.time() then
-    kong.log.info("certificate for host ", host, " is not due for renewal (storage)")
-    return nil
+    return false
   end
 
-  return key, true, false
+  return true
 end
 
--- returns key, if_renew, if_cleanup_renew_conf, err
-local function check_expire_dao(st, host, threshold)
-  local key
+-- loads existing cert and key for host from storage or Kong database
+local function load_certkey(conf, host)
+  if dbless then
+    local _, st, err = new_storage_adapter(conf)
+    if err then
+      return nil, err
+    end
+
+    local certkey, err = st:get(CERTKEY_KEY_PREFIX .. host)
+    if err then
+      return nil, err
+    elseif not certkey then
+      return nil
+    end
+
+    return cjson.decode(certkey)
+  end
+
   local sni_entity, err = kong.db.snis:select_by_name(host)
   if err then
-    return nil, false, false, "can't read SNI entity"
+    return nil, "can't read SNI entity"
   elseif not sni_entity then
-    kong.log.warn("SNI ", host, " is deleted from Kong database, deleting renew config")
-    return nil, false, true
+    kong.log.info("SNI ", host, " is not found in Kong database")
+    return
   end
 
   if not sni_entity or not sni_entity.certificate then
-    return nil, false, false, "DAO returns empty SNI entity or Certificte entity"
+    return nil, "DAO returns empty SNI entity or Certificte entity"
   end
 
   local cert_entity, err = kong.db.certificates:select({ id = sni_entity.certificate.id })
   if err then
     kong.log.info("can't read certificate ", sni_entity.certificate.id, " from db",
                   ", deleting renew config")
-    return nil, false, true
+    return nil, nil
   elseif not cert_entity then
-    kong.log.warn("certificate for SNI ", host, " is deleted from Kong database, deleting renew config")
-    return nil, false, true
+    kong.log.warn("certificate for SNI ", host, " is not found in Kong database")
+    return nil, nil
   end
 
-  local crt, err = x509.new(cert_entity.cert)
+  return {
+    cert = cert_entity.cert,
+    key = cert_entity.key,
+  }
+end
+
+local function load_certkey_cached(conf, host)
+  local _, st, err = new_storage_adapter(conf)
   if err then
-    kong.log.info("can't parse cert stored in Kong: ", err)
-  elseif crt:get_not_after() - threshold > ngx.time() then
-    kong.log.info("certificate for host ", host, " is not due for renewal (DAO)")
-    return nil
+    return nil, err
   end
-
-  if cert_entity then
-    key = cert_entity.key
-  end
-
-  return key, true
+  local key = CERTKEY_KEY_PREFIX .. host
+  return cached_get(st, key, deserialize_certkey)
 end
 
 local function renew_certificate_storage(conf)
@@ -332,6 +375,11 @@ local function renew_certificate_storage(conf)
       kong.log.err("can't read renew conf: ", err)
       goto renew_continue
     end
+    if not renew_conf then
+      kong.log.err("renew config key ",renew_conf_key, " is empty")
+      goto renew_continue
+    end
+
     renew_conf = cjson.decode(renew_conf)
 
     local host = renew_conf.host
@@ -341,42 +389,40 @@ local function renew_certificate_storage(conf)
       goto renew_continue
     end
 
-    local check_expire_func
-    if dbless then
-      check_expire_func = check_expire_dbless
-    else
-      check_expire_func = check_expire_dao
-    end
-
-    local key, renew, clean_renew_conf, err = check_expire_func(st, host, expire_threshold)
-
+    local certkey, err = load_certkey(conf, host)
     if err then
-      kong.log.err("error checking expiry for certificate of host:", host, ":", err)
+      kong.log.err("error loading existing certkey for host: ", host, ": ", err)
       goto renew_continue
     end
 
-    if renew then
-      if not key then
-        kong.log.info("previous key is not defined, creating new key")
-      end
-
-      kong.log.info("renew certificate for host ", host)
-      err = update_certificate(conf, host, key)
-      if err then
-        kong.log.err("failed to renew certificate: ", err)
-        -- return
-        -- update_certificate could fail if the domain is no longer pointing to us (say http-01 fail)
-        -- which is common in our case. If we return it could block the renewal of rest of domains
-        -- To be solved in future updates - https://github.com/Kong/kong-plugin-acme/issues/48
-        goto renew_continue
-      end
-    end
-
-    if clean_renew_conf then
+    if not certkey then
+      kong.log.warn("deleting renewal config for host: ", host)
       err = st:delete(renew_conf_key)
       if err then
         kong.log.warn("error deleting unneeded renew config key \"", renew_conf_key, "\"")
       end
+      goto renew_continue
+    end
+
+    local renew, err = check_expire(certkey.cert, expire_threshold)
+    if err then
+      kong.log.err("error checking expiry for certificate of host: ", host, ": ", err)
+      goto renew_continue
+    end
+
+    if not renew then
+      kong.log.info("certificate for ", host, " is not due for renewal")
+      goto renew_continue
+    end
+
+    if not certkey.key then
+      kong.log.info("previous key is not defined, creating new key")
+    end
+
+    kong.log.info("renew certificate for host ", host)
+    local _, err = update_certificate(conf, host, certkey.key)
+    if err then
+      kong.log.err("failed to renew certificate: ", err)
     end
 
 ::renew_continue::
@@ -401,36 +447,21 @@ local function renew_certificate(premature)
   end
 end
 
-
-local function deserialize_certkey(j)
-  j = cjson.decode(j)
-  if not j.key or not j.key then
-    return nil, "key or cert found in storage"
-  end
-  local cert, err = ngx_ssl.cert_pem_to_der(j.cert)
-  if err then
-    return nil, err
-  end
-  local key, err = ngx_ssl.priv_key_pem_to_der(j.key)
-  if err then
-    return nil, err
-  end
-  return {
-    key = key,
-    cert = cert,
-  }
-end
-
-local function load_certkey(conf, host)
+local function load_renew_hosts(conf)
   local _, st, err = new_storage_adapter(conf)
   if err then
     return nil, err
   end
-  -- see L218: we set neg ttl to be same as LOCK_TIMEOUT
-  return cached_get(st,
-    CERTKEY_KEY_PREFIX .. host, deserialize_certkey,
-    nil, LOCK_TIMEOUT
-  )
+  local hosts, err = st:list(RENEW_KEY_PREFIX)
+  if err then
+    return nil, err
+  end
+
+  local data = {}
+  for i, host in ipairs(hosts) do
+    data[i] = string.sub(host, #RENEW_KEY_PREFIX + 1)
+  end
+  return data
 end
 
 return {
@@ -439,16 +470,17 @@ return {
   update_certificate = update_certificate,
   renew_certificate = renew_certificate,
   store_renew_config = store_renew_config,
-  -- for dbless
+  load_renew_hosts = load_renew_hosts,
   load_certkey = load_certkey,
+  load_certkey_cached = load_certkey_cached,
 
   -- for test only
-  _save = save,
+  _save_dao = save_dao,
   _order = order,
   _account_name = account_name,
   _renew_key_prefix = RENEW_KEY_PREFIX,
   _certkey_key_prefix = CERTKEY_KEY_PREFIX,
   _renew_certificate_storage = renew_certificate_storage,
-  _check_expire_dbless = check_expire_dbless,
-  _check_expire_dao = check_expire_dao,
+  _check_expire = check_expire,
+  _set_is_dbless = function(d) dbless = d end,
 }

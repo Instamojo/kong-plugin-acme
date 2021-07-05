@@ -327,6 +327,11 @@ local function renew_certificate_storage(conf)
   end
 
   for _, renew_conf_key in ipairs(renew_conf_keys) do
+    
+    -- Sleep for 3/5th of a minute before each try, so that we can get 300 renewals in 3 hrs.
+    -- Ref. https://letsencrypt.org/docs/rate-limits/
+    ngx.sleep(36)
+
     local renew_conf, err = st:get(renew_conf_key)
     if err then
       kong.log.err("can't read renew conf: ", err)
@@ -396,7 +401,9 @@ local function renew_certificate(premature)
 
     if plugin.name == "acme" then
       kong.log.info("renew storage configured in acme plugin: ", plugin.id)
+      local x = ngx.time()
       renew_certificate_storage(plugin.config)
+      kong.log.info("Time take for renewal flow by worker " .. ngx.worker.id() .. " is " ..  ngx.time()-x)
     end
   end
 end

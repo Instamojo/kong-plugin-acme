@@ -54,6 +54,47 @@ local function new_storage_adapter(conf)
   return storage, st, err
 end
 
+-- return true if domain exists in acme_domain config, else false.
+local function check_domain_exists_in_config(host)
+  -- retrieve acme_domain for given host
+  local entity, err = kong.db.acme_domain:select_by_name(host)
+  if err then
+    kong.log.err("[check_domain_exists_in_config] Error when checking for acme_domain " .. host .. " in config: " .. err)
+    -- If we are not sure, return true
+    return true
+  end
+  -- If entity was not found, return false. 
+  -- implies, The host's certificate entity will be deleted.
+  if not entity then
+    return false
+  end
+  return true
+end
+
+local function delete_certificate_for_host(host)
+  -- retrieve sni entity for the given host
+  local sni_entity, err = kong.db.snis:select_by_name(host)
+  if err then
+    kong.log.err("[delete_certificate_for_host] error finding sni entity for: " .. host .. " : " .. err)
+    return
+  end
+  if not sni_entity then
+    kong.log.info("[delete_certificate_for_host] Could not find sni_entity for: " .. host)
+    return
+  end
+  local cert_id = sni_entity.certificate.id
+  -- delete certificate for the sni_entity and sni_entity record
+  --- ..binded by foreign key constraint with certificate record
+  local ok, err = kong.db.certificates:delete({
+    id = cert_id,
+  })
+  if not ok then
+    kong.log.err("[delete_certificate_for_host] error deleting certificate: " .. cert_id .. " for sni_entity:  " .. host .. " : " .. err)
+    return
+  end
+  kong.log.info("[delete_certificate_for_host] Successfully deleted certificate record for host: " .. host)
+end
+
 local function new(conf)
   local storage_full_path, st, err = new_storage_adapter(conf)
   if err then
@@ -332,9 +373,21 @@ local function renew_certificate_storage(conf)
       kong.log.err("can't read renew conf: ", err)
       goto renew_continue
     end
+    if not renew_conf then
+      kong.log.warn("Got null value for renew_conf")
+      goto renew_continue
+    end
     renew_conf = cjson.decode(renew_conf)
 
     local host = renew_conf.host
+
+    -- If acme_domain config is not present,
+    -- then delete the certificate and sni entities for the same.
+    if not check_domain_exists_in_config(host) then
+      -- Delete certificate and sni entities for the said host.
+      delete_certificate_for_host(host)
+    end
+
     local expire_threshold = 86400 * conf.renew_threshold_days
     if renew_conf.expire_at - expire_threshold > ngx.time() then
       kong.log.info("certificate for host ", host, " is not due for renewal")

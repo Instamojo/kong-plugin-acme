@@ -130,7 +130,7 @@ end
 
 function LetsencryptHandler:init_worker()
   local worker_id = ngx.worker.id()
-  kong.log.info("acme renew timer started on worker ", worker_id)
+  kong.log.info("acme renew timer started on worker " .. worker_id)
   ngx.timer.every(86400, client.renew_certificate)
 end
 

@@ -13,6 +13,84 @@ local CERTKEY_KEY_PREFIX = "kong_acme:cert_key:"
 
 local LOCK_TIMEOUT = 30 -- in seconds
 
+local function get_allowed_config_domains(host)
+  local domains = {}
+  local t = ngx.re.match(host, "(?:(.+)[.])*([^.]+[.][^.]+)$", "jo")
+
+  -- Root domain wildcard pattern
+  local root = t[table.maxn(t)]
+  table.insert(domains, root)
+  table.insert(domains, "*." .. root)
+
+  if t[1] then
+    local it, err = ngx.re.gmatch(t[1], "([^.]+)", "i")
+    local subs = {}
+    while true do
+      local m, err = it()
+      if not m then
+        break
+      end
+
+      if not err then
+        table.insert(subs, m[0])
+      end
+    end
+
+    local prev = root
+    for i=1, #subs do
+      local index = #subs + 1 - i
+      local new_domain = subs[index] .. "." .. prev
+
+      if index == 1 then
+        table.insert(domains, new_domain)
+
+      else
+        table.insert(domains, "*." .. new_domain)
+      end
+
+      prev = new_domain
+    end
+  end
+
+  return domains
+end
+
+
+local function load_domain(domain)
+  kong.log.debug("Loading domain from DB ", domain)
+  local entity, err = kong.db.acme_domain:select_by_name(domain)
+  if not entity then
+    return nil, err
+  end
+  return entity
+end
+
+
+local function is_domain_db_config_exists(host)
+  local allowed_domains = get_allowed_config_domains(host)
+  for _, domain in ipairs(allowed_domains) do
+    kong.log.debug("checking domain " .. domain .. " in DB")
+    local domain_cache_key = kong.db.acme_domain:cache_key(domain)
+    local entity, err = kong.cache:get(domain_cache_key, nil, load_domain, domain)
+
+    if err then
+      kong.log.err("can't load domain from storage: ", err)
+      --return kong.response.exit(500, { message = "Unexpected error" })
+      -- Not sure if domain exists, return true?
+      -- should we consider domain to exist, allow certificate gen. for it?
+      return true
+    end
+
+    if entity then
+      kong.log.info("config exists for domain: ", domain)
+      return true
+    end
+  end
+
+  -- no domain in cache nor datastore
+  return false
+end
+
 local function account_name(conf)
   return "kong_acme:account:" .. conf.api_uri .. ":" ..
                       ngx.encode_base64(conf.account_email)
@@ -54,33 +132,17 @@ local function new_storage_adapter(conf)
   return storage, st, err
 end
 
--- return true if domain exists in acme_domain config, else false.
-local function check_domain_exists_in_config(host)
-  -- retrieve acme_domain for given host
-  local entity, err = kong.db.acme_domain:select_by_name(host)
-  if err then
-    kong.log.err("[check_domain_exists_in_config] Error when checking for acme_domain " .. host .. " in config: " .. err)
-    -- If we are not sure, return true
-    return true
-  end
-  -- If entity was not found, return false. 
-  -- implies, The host's certificate entity will be deleted.
-  if not entity then
-    return false
-  end
-  return true
-end
-
+-- Return error (else  nil)
 local function delete_certificate_for_host(host)
   -- retrieve sni entity for the given host
   local sni_entity, err = kong.db.snis:select_by_name(host)
   if err then
     kong.log.err("[delete_certificate_for_host] error finding sni entity for: " .. host .. " : " .. err)
-    return
+    return err
   end
   if not sni_entity then
     kong.log.info("[delete_certificate_for_host] Could not find sni_entity for: " .. host)
-    return
+    return nil
   end
   local cert_id = sni_entity.certificate.id
   -- delete certificate for the sni_entity and sni_entity record
@@ -90,9 +152,10 @@ local function delete_certificate_for_host(host)
   })
   if not ok then
     kong.log.err("[delete_certificate_for_host] error deleting certificate: " .. cert_id .. " for sni_entity:  " .. host .. " : " .. err)
-    return
+    return err
   end
   kong.log.info("[delete_certificate_for_host] Successfully deleted certificate record for host: " .. host)
+  return nil
 end
 
 local function new(conf)
@@ -383,9 +446,13 @@ local function renew_certificate_storage(conf)
 
     -- If acme_domain config is not present,
     -- then delete the certificate and sni entities for the same.
-    if not check_domain_exists_in_config(host) then
+    if not is_domain_db_config_exists(host) then
       -- Delete certificate and sni entities for the said host.
-      delete_certificate_for_host(host)
+      local err = delete_certificate_for_host(host)
+      if err then
+        -- acme_domain doesn't exist but certificate was not deleted. skip renewal.
+        goto renew_continue
+      end
     end
 
     local expire_threshold = 86400 * conf.renew_threshold_days
@@ -492,6 +559,8 @@ return {
   update_certificate = update_certificate,
   renew_certificate = renew_certificate,
   store_renew_config = store_renew_config,
+  is_domain_db_config_exists = is_domain_db_config_exists,
+  delete_certificate_for_host = delete_certificate_for_host,
   -- for dbless
   load_certkey = load_certkey,
 

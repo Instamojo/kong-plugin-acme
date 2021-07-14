@@ -65,7 +65,7 @@ local function load_domain(domain)
   return entity
 end
 
-
+-- return true if domain exists in db, else false, and error (if any)
 local function is_domain_db_config_exists(host)
   local allowed_domains = get_allowed_config_domains(host)
   for _, domain in ipairs(allowed_domains) do
@@ -76,19 +76,18 @@ local function is_domain_db_config_exists(host)
     if err then
       kong.log.err("can't load domain from storage: ", err)
       --return kong.response.exit(500, { message = "Unexpected error" })
-      -- Not sure if domain exists, return true?
-      -- should we consider domain to exist, allow certificate gen. for it?
-      return true
+      -- error while looking for acme domain.
+      return true, err
     end
 
     if entity then
       kong.log.info("config exists for domain: ", domain)
-      return true
+      return true, nil
     end
   end
 
   -- no domain in cache nor datastore
-  return false
+  return false, nil
 end
 
 local function account_name(conf)
@@ -447,7 +446,11 @@ local function renew_certificate_storage(conf)
 
     -- If acme_domain config is not present,
     -- then delete the certificate and sni entities for the same.
-    if not is_domain_db_config_exists(host) then
+    local domain_exists, err = is_domain_db_config_exists(host)
+    if err then
+      goto renew_continue
+    end
+    if not domain_exists then
       -- Delete certificate and sni entities for the said host.
       local err = delete_certificate_for_host(host)
       if err then

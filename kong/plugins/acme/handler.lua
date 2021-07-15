@@ -80,7 +80,7 @@ function LetsencryptHandler:certificate(conf)
     local domain_exists, err = client.is_domain_db_config_exists(host)
     if err then
       kong.log.err("error while checking if domain exists in config : " .. err)
-      return
+      return kong.response.exit(500, { message = "Unexpected error" })
     end
     if not domain_exists then
       kong.log.warn("ignoring because domain is not in DB whitelist : ", host)
@@ -165,7 +165,11 @@ function LetsencryptHandler:access(conf)
 
     else
       local domain_exists, err = client.is_domain_db_config_exists(host)
-      if err or not domain_exists then
+      if err then
+        kong.log.err("error while checking if domain exists in config : " .. err)
+        return kong.response.exit(500, { message = "Unexpected error" })
+      end
+      if not domain_exists then
         return
       end
     end

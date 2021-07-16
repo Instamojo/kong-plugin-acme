@@ -13,6 +13,83 @@ local CERTKEY_KEY_PREFIX = "kong_acme:cert_key:"
 
 local LOCK_TIMEOUT = 30 -- in seconds
 
+local function get_allowed_config_domains(host)
+  local domains = {}
+  local t = ngx.re.match(host, "(?:(.+)[.])*([^.]+[.][^.]+)$", "jo")
+
+  -- Root domain wildcard pattern
+  local root = t[table.maxn(t)]
+  table.insert(domains, root)
+  table.insert(domains, "*." .. root)
+
+  if t[1] then
+    local it, err = ngx.re.gmatch(t[1], "([^.]+)", "i")
+    local subs = {}
+    while true do
+      local m, err = it()
+      if not m then
+        break
+      end
+
+      if not err then
+        table.insert(subs, m[0])
+      end
+    end
+
+    local prev = root
+    for i=1, #subs do
+      local index = #subs + 1 - i
+      local new_domain = subs[index] .. "." .. prev
+
+      if index == 1 then
+        table.insert(domains, new_domain)
+
+      else
+        table.insert(domains, "*." .. new_domain)
+      end
+
+      prev = new_domain
+    end
+  end
+
+  return domains
+end
+
+
+local function load_domain(domain)
+  kong.log.debug("Loading domain from DB ", domain)
+  local entity, err = kong.db.acme_domain:select_by_name(domain)
+  if not entity then
+    return nil, err
+  end
+  return entity
+end
+
+-- return true if domain exists in db, else false, and error (if any)
+local function is_domain_db_config_exists(host)
+  local allowed_domains = get_allowed_config_domains(host)
+  for _, domain in ipairs(allowed_domains) do
+    kong.log.debug("checking domain " .. domain .. " in DB")
+    local domain_cache_key = kong.db.acme_domain:cache_key(domain)
+    local entity, err = kong.cache:get(domain_cache_key, nil, load_domain, domain)
+
+    if err then
+      kong.log.err("can't load domain from storage: ", err)
+      --return kong.response.exit(500, { message = "Unexpected error" })
+      -- error while looking for acme domain.
+      return true, err
+    end
+
+    if entity then
+      kong.log.info("config exists for domain: ", domain)
+      return true, nil
+    end
+  end
+
+  -- no domain in cache nor datastore
+  return false, nil
+end
+
 local function account_name(conf)
   return "kong_acme:account:" .. conf.api_uri .. ":" ..
                       ngx.encode_base64(conf.account_email)
@@ -52,6 +129,32 @@ local function new_storage_adapter(conf)
   local lib = require(storage)
   local st, err = lib.new(storage_config)
   return storage, st, err
+end
+
+-- Return error (else  nil)
+local function delete_certificate_for_host(host)
+  -- retrieve sni entity for the given host
+  local sni_entity, err = kong.db.snis:select_by_name(host)
+  if err then
+    kong.log.err("[delete_certificate_for_host] error finding sni entity for: " .. host .. " : " .. err)
+    return err
+  end
+  if not sni_entity then
+    kong.log.info("[delete_certificate_for_host] Could not find sni_entity for: " .. host)
+    return nil
+  end
+  local cert_id = sni_entity.certificate.id
+  -- delete certificate for the sni_entity and sni_entity record
+  --- ..binded by foreign key constraint with certificate record
+  local ok, err = kong.db.certificates:delete({
+    id = cert_id,
+  })
+  if not ok then
+    kong.log.err("[delete_certificate_for_host] error deleting certificate: " .. cert_id .. " for sni_entity:  " .. host .. " : " .. err)
+    return err
+  end
+  kong.log.info("[delete_certificate_for_host] Successfully deleted certificate record for host: " .. host)
+  return nil
 end
 
 local function new(conf)
@@ -328,18 +431,34 @@ local function renew_certificate_storage(conf)
 
   for _, renew_conf_key in ipairs(renew_conf_keys) do
     
-    -- Sleep for 3/5th of a minute before each try, so that we can get 300 renewals in 3 hrs.
-    -- Ref. https://letsencrypt.org/docs/rate-limits/
-    ngx.sleep(36)
-
     local renew_conf, err = st:get(renew_conf_key)
     if err then
       kong.log.err("can't read renew conf: ", err)
       goto renew_continue
     end
+    if not renew_conf then
+      kong.log.warn("Got null value for renew_conf")
+      goto renew_continue
+    end
     renew_conf = cjson.decode(renew_conf)
 
     local host = renew_conf.host
+
+    -- If acme_domain config is not present,
+    -- then delete the certificate and sni entities for the same.
+    local domain_exists, err = is_domain_db_config_exists(host)
+    if err then
+      goto renew_continue
+    end
+    if not domain_exists then
+      -- Delete certificate and sni entities for the said host.
+      local err = delete_certificate_for_host(host)
+      if err then
+        -- acme_domain doesn't exist but certificate was not deleted. skip renewal.
+        goto renew_continue
+      end
+    end
+
     local expire_threshold = 86400 * conf.renew_threshold_days
     if renew_conf.expire_at - expire_threshold > ngx.time() then
       kong.log.info("certificate for host ", host, " is not due for renewal")
@@ -364,6 +483,10 @@ local function renew_certificate_storage(conf)
       if not key then
         kong.log.info("previous key is not defined, creating new key")
       end
+
+      -- Sleep for 3/5th of a minute before each try, so that we can get 300 renewals in 3 hrs.
+      -- Ref. https://letsencrypt.org/docs/rate-limits/
+      ngx.sleep(36)
 
       kong.log.info("renew certificate for host ", host)
       err = update_certificate(conf, host, key)
@@ -446,6 +569,8 @@ return {
   update_certificate = update_certificate,
   renew_certificate = renew_certificate,
   store_renew_config = store_renew_config,
+  is_domain_db_config_exists = is_domain_db_config_exists,
+  delete_certificate_for_host = delete_certificate_for_host,
   -- for dbless
   load_certkey = load_certkey,
 

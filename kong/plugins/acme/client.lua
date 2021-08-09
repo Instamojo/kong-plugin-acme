@@ -10,6 +10,7 @@ local dbless = kong.configuration.database == "off"
 local RENEW_KEY_PREFIX = "kong_acme:renew_config:"
 local RENEW_LAST_RUN_KEY = "kong_acme:renew_last_run"
 local CERTKEY_KEY_PREFIX = "kong_acme:cert_key:"
+local WORKER_KEY = "kong_acme:renew_worker"
 
 local LOCK_TIMEOUT = 30 -- in seconds
 
@@ -129,6 +130,30 @@ local function new_storage_adapter(conf)
   local lib = require(storage)
   local st, err = lib.new(storage_config)
   return storage, st, err
+end
+
+local function store_worker_config(conf)
+  local _, st, err = new_storage_adapter(conf)
+  if err then
+    return err
+  end
+  return st:set(WORKER_KEY, tostring(ngx.worker.id()), 3600) -- 1 Hour TTL
+end
+
+local function get_worker_config(conf)
+  local _, st, err = new_storage_adapter(conf)
+  if err then
+    return nil, err
+  end
+  return st:get(WORKER_KEY)
+end
+
+local function delete_worker_config(conf)
+  local _, st, err = new_storage_adapter(conf)
+  if err then
+    return nil, err
+  end
+  return st:delete(WORKER_KEY)
 end
 
 -- Return error (else  nil)
@@ -524,9 +549,29 @@ local function renew_certificate(premature)
 
     if plugin.name == "acme" then
       kong.log.info("renew storage configured in acme plugin: ", plugin.id)
+
+      -- If Renew Worker Key Not Exists
+      local worker, _ = get_worker_config(plugin.config)
+      if worker then
+        kong.log.notice("Worker lock exists in acme storage. Another worker '" .. worker .. "' seems to be renewing. Skipping renewal flow for worker " .. ngx.worker.id())
+        return
+      end
+      --  Create & Save Worker Key
+      local err = store_worker_config(plugin.config)
+      if err then
+        kong.log.err("Could not place worker lock: " .. ngx.worker.id() .. " with error: " .. err)
+        -- continue?
+      end
+
       local x = ngx.time()
       renew_certificate_storage(plugin.config)
       kong.log.info("Time take for renewal flow by worker " .. ngx.worker.id() .. " is " ..  ngx.time()-x)
+
+      --- Delete Renewal Worker Lock
+      local err_del = delete_worker_config(plugin.config)
+      if err_del then
+        kong.log.err("failed to delete worker_key lock for " .. worker .. " with error:" .. err_del)
+      end
     end
   end
 end

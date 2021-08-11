@@ -137,15 +137,7 @@ local function store_worker_config(conf)
   if err then
     return err
   end
-  return st:set(WORKER_KEY, tostring(ngx.worker.id()), 3600) -- 1 Hour TTL
-end
-
-local function get_worker_config(conf)
-  local _, st, err = new_storage_adapter(conf)
-  if err then
-    return nil, err
-  end
-  return st:get(WORKER_KEY)
+  return st:add(WORKER_KEY, tostring(ngx.worker.id()), 3600) -- 1 Hour TTL
 end
 
 local function delete_worker_config(conf)
@@ -550,17 +542,13 @@ local function renew_certificate(premature)
     if plugin.name == "acme" then
       kong.log.info("renew storage configured in acme plugin: ", plugin.id)
 
-      -- If Renew Worker Key Not Exists
-      local worker, _ = get_worker_config(plugin.config)
-      if worker then
-        kong.log.notice("Worker lock exists in acme storage. Another worker '" .. worker .. "' seems to be renewing. Skipping renewal flow for worker " .. ngx.worker.id())
-        return
-      end
-      --  Create & Save Worker Key
+      -- Create & Save Worker Key
+      -- If worker key already exists, then this means some other worker is renew_config
+      -- Else, continue?
       local err = store_worker_config(plugin.config)
-      if err then
+      if err and err == "exists" then
         kong.log.err("Could not place worker lock: " .. ngx.worker.id() .. " with error: " .. err)
-        -- continue?
+        return
       end
 
       local x = ngx.time()
@@ -570,7 +558,7 @@ local function renew_certificate(premature)
       --- Delete Renewal Worker Lock
       local err_del = delete_worker_config(plugin.config)
       if err_del then
-        kong.log.err("failed to delete worker_key lock for " .. worker .. " with error:" .. err_del)
+        kong.log.err("failed to delete worker_key lock for " .. ngx.worker.id() .. " with error:" .. err_del)
       end
     end
   end

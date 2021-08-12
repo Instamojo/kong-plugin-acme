@@ -560,8 +560,9 @@ local function renew_certificate(premature)
       local err_del = delete_worker_config(plugin.config)
       if err_del then
         kong.log.err("failed to delete worker_key lock for " .. ngx.worker.id() .. " with error:" .. err_del)
+      else
+        kong.log.info("Successfully removed worker lock: " .. ngx.worker.id())
       end
-      kong.log.info("Successfully removed worker lock: " .. ngx.worker.id())
     end
   end
 end

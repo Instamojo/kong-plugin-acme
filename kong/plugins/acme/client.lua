@@ -546,10 +546,11 @@ local function renew_certificate(premature)
       -- If worker key already exists, then this means some other worker is renew_config
       -- Else, continue?
       local err = store_worker_config(plugin.config)
-      if err and err == "exists" then
+      if err then
         kong.log.err("Could not place worker lock: " .. ngx.worker.id() .. " with error: " .. err)
         return
       end
+      kong.log.info("Successfully placed worker lock: " .. ngx.worker.id())
 
       local x = ngx.time()
       renew_certificate_storage(plugin.config)
@@ -560,6 +561,7 @@ local function renew_certificate(premature)
       if err_del then
         kong.log.err("failed to delete worker_key lock for " .. ngx.worker.id() .. " with error:" .. err_del)
       end
+      kong.log.info("Successfully removed worker lock: " .. ngx.worker.id())
     end
   end
 end

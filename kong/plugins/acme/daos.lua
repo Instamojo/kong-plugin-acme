@@ -24,6 +24,7 @@ return {
     fields = {
       { id = typedefs.uuid },
       { name = { type = "string", required = true, unique = true }, },
+      { target = { type = "string" }, },
       { created_at = typedefs.auto_timestamp_s },
     },
   },

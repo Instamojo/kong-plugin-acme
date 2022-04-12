@@ -197,6 +197,16 @@ function LetsencryptHandler:access(conf)
 
       acme_client:serve_http_challenge()
     end
+
+    -- Need to identify which upstream server we to route the request.
+    local host = kong.request.get_host()
+    if host then
+      local entity, _ = kong.db.acme_domain:select_by_name(host)
+      if entity then
+        kong.service.request.set_header("X-INSTAMOJO-TARGET", entity.target)
+      end
+    end
+
     return
   end
 end

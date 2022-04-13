@@ -203,7 +203,7 @@ function LetsencryptHandler:access(conf)
     if host then
       local entity, _ = kong.db.acme_domain:select_by_name(host)
       if entity then
-        kong.service.request.set_header("X-INSTAMOJO-TARGET", entity.target)
+        kong.service.request.set_header("X-INSTAMOJO-TARGET", (entity.target or ""))
       end
     end
 

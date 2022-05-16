@@ -1,5 +1,8 @@
 package = "kong-plugin-acme"
-version = "0.2.10-7"
+-- The version '0.0.1' is the source code version, the trailing '1' is the version of this rockspec.
+-- whenever the source version changes, the rockspec should be reset to 1. The rockspec version is only
+-- updated (incremented) when this file changes, but the source remains the same.
+version = "0.2.11-1"
 source = {
    url = "git+https://github.com/Kong/kong-plugin-acme.git",
    tag = "0.2.10",
@@ -18,6 +21,7 @@ build = {
       ["kong.plugins.acme.handler"] = "kong/plugins/acme/handler.lua",
       ["kong.plugins.acme.migrations.000_base_acme"] = "kong/plugins/acme/migrations/000_base_acme.lua",
       ["kong.plugins.acme.migrations.001_022_to_030"] = "kong/plugins/acme/migrations/001_022_to_030.lua",
+      ["kong.plugins.acme.migrations.002_030_to_031"] = "kong/plugins/acme/migrations/002_030_to_031.lua",
       ["kong.plugins.acme.migrations.init"] = "kong/plugins/acme/migrations/init.lua",
       ["kong.plugins.acme.schema"] = "kong/plugins/acme/schema.lua",
       ["kong.plugins.acme.storage.kong"] = "kong/plugins/acme/storage/kong.lua"

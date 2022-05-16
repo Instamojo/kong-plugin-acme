@@ -150,6 +150,15 @@ function LetsencryptHandler:access(conf)
 
   local protocol = kong.client.get_protocol()
 
+  -- Need to identify which upstream server we to route the request.
+  local host = kong.request.get_host()
+  if host then
+    local entity, _ = kong.db.acme_domain:select_by_name(host)
+    if entity then
+      kong.service.request.set_header("X-INSTAMOJO-TARGET", (entity.target or ""))
+    end
+  end
+
   -- http-01 challenge only sends to http port
   if protocol == 'http' then
     local host = kong.request.get_host()
@@ -197,6 +206,16 @@ function LetsencryptHandler:access(conf)
 
       acme_client:serve_http_challenge()
     end
+
+    -- Need to identify which upstream server we to route the request.
+    local host = kong.request.get_host()
+    if host then
+      local entity, _ = kong.db.acme_domain:select_by_name(host)
+      if entity then
+        kong.service.request.set_header("X-INSTAMOJO-TARGET", (entity.target or ""))
+      end
+    end
+
     return
   end
 end

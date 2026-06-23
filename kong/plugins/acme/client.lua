@@ -11,6 +11,7 @@ local RENEW_KEY_PREFIX = "kong_acme:renew_config:"
 local RENEW_LAST_RUN_KEY = "kong_acme:renew_last_run"
 local CERTKEY_KEY_PREFIX = "kong_acme:cert_key:"
 local WORKER_KEY = "kong_acme:renew_worker"
+local RENEW_LOG_PREFIX = "[ACME_RENEW] "
 
 local LOCK_TIMEOUT = 30 -- in seconds
 
@@ -432,53 +433,73 @@ end
 local function renew_certificate_storage(conf)
   local _, st, err = new_storage_adapter(conf)
   if err then
-    kong.log.err("can't create storage adapter: ", err)
+    kong.log.err(RENEW_LOG_PREFIX, "can't create storage adapter: ", err)
     return
   end
 
   local renew_conf_keys, err = st:list(RENEW_KEY_PREFIX)
   if err then
-    kong.log.err("can't list renew hosts: ", err)
+    kong.log.err(RENEW_LOG_PREFIX, "can't list renew hosts: ", err)
     return
   end
+
+  kong.log.info(RENEW_LOG_PREFIX, "scan keys=", #renew_conf_keys)
+
   err = st:set(RENEW_LAST_RUN_KEY, ngx.localtime())
   if err then
-    kong.log.warn("can't set renew_last_run: ", err)
+    kong.log.warn(RENEW_LOG_PREFIX, "can't set renew_last_run: ", err)
   end
 
   for _, renew_conf_key in ipairs(renew_conf_keys) do
-    
+
     local renew_conf, err = st:get(renew_conf_key)
     if err then
-      kong.log.err("can't read renew conf: ", err)
+      kong.log.warn(RENEW_LOG_PREFIX, "can't read renew conf key=", renew_conf_key, " err=", err)
       goto renew_continue
     end
     if not renew_conf then
-      kong.log.warn("Got null value for renew_conf")
+      kong.log.warn(RENEW_LOG_PREFIX, "empty renew conf key=", renew_conf_key)
       goto renew_continue
     end
-    renew_conf = cjson.decode(renew_conf)
+    local ok, decoded = pcall(cjson.decode, renew_conf)
+    if not ok or not decoded then
+      kong.log.warn(RENEW_LOG_PREFIX, "invalid renew conf JSON key=", renew_conf_key)
+      goto renew_continue
+    end
+    renew_conf = decoded
 
     local host = renew_conf.host
+    if not host or host == "" then
+      kong.log.warn(RENEW_LOG_PREFIX, "invalid renew conf host key=", renew_conf_key)
+      goto renew_continue
+    end
+    if not renew_conf.expire_at then
+      kong.log.warn(RENEW_LOG_PREFIX, "invalid renew conf expire_at host=", host)
+      goto renew_continue
+    end
 
     -- If acme_domain config is not present,
     -- then delete the certificate and sni entities for the same.
     local domain_exists, err = is_domain_db_config_exists(host)
     if err then
+      kong.log.err(RENEW_LOG_PREFIX, "domain check failed host=", host, " err=", err)
       goto renew_continue
     end
     if not domain_exists then
+      kong.log.info(RENEW_LOG_PREFIX, "skip host=", host, " reason=domain_not_in_whitelist")
       -- Delete certificate and sni entities for the said host.
       local err = delete_certificate_for_host(host)
       if err then
+        kong.log.warn(RENEW_LOG_PREFIX, "cleanup failed for skipped host=", host, " err=", err)
         -- acme_domain doesn't exist but certificate was not deleted. skip renewal.
         goto renew_continue
       end
+      goto renew_continue
     end
 
     local expire_threshold = 86400 * conf.renew_threshold_days
     if renew_conf.expire_at - expire_threshold > ngx.time() then
-      kong.log.info("certificate for host ", host, " is not due for renewal")
+      kong.log.info(RENEW_LOG_PREFIX, "skip host=", host, " reason=outside_renew_window")
       goto renew_continue
     end
 
@@ -492,35 +513,37 @@ local function renew_certificate_storage(conf)
     local key, renew, clean_renew_conf, err = check_expire_func(st, host, expire_threshold)
 
     if err then
-      kong.log.err("error checking expiry for certificate of host:", host, ":", err)
+      kong.log.err(RENEW_LOG_PREFIX, "expiry check failed host=", host, " err=", err)
       goto renew_continue
     end
 
     if renew then
-      if not key then
-        kong.log.info("previous key is not defined, creating new key")
-      end
+      kong.log.info(RENEW_LOG_PREFIX, "attempt host=", host)
 
       -- Sleep for 3/5th of a minute before each try, so that we can get 300 renewals in 3 hrs.
       -- Ref. https://letsencrypt.org/docs/rate-limits/
       ngx.sleep(36)
 
-      kong.log.info("renew certificate for host ", host)
       err = update_certificate(conf, host, key)
       if err then
-        kong.log.err("failed to renew certificate: ", err)
+        kong.log.err(RENEW_LOG_PREFIX, "failed host=", host, " err=", err)
         -- return
         -- update_certificate could fail if the domain is no longer pointing to us (say http-01 fail)
         -- which is common in our case. If we return it could block the renewal of rest of domains
         -- To be solved in future updates - https://github.com/Kong/kong-plugin-acme/issues/48
         goto renew_continue
       end
+
+      kong.log.info(RENEW_LOG_PREFIX, "success host=", host)
+
+    else
+      kong.log.info(RENEW_LOG_PREFIX, "skip host=", host, " reason=not_due_by_current_cert")
     end
 
     if clean_renew_conf then
       err = st:delete(renew_conf_key)
       if err then
-        kong.log.warn("error deleting unneeded renew config key \"", renew_conf_key, "\"")
+        kong.log.warn(RENEW_LOG_PREFIX, "failed deleting renew conf key=", renew_conf_key)
       end
     end
 
@@ -536,32 +559,33 @@ local function renew_certificate(premature)
 
   for plugin, err in kong.db.plugins:each(1000) do
     if err then
-      kong.log.warn("error fetching plugin: ", err)
+      kong.log.warn(RENEW_LOG_PREFIX, "error fetching plugin: ", err)
     end
 
     if plugin.name == "acme" then
-      kong.log.info("renew storage configured in acme plugin: ", plugin.id)
+      kong.log.info(RENEW_LOG_PREFIX, "start plugin_id=", plugin.id,
+                    " worker=", ngx.worker.id())
 
       -- Create & Save Worker Key
       -- If worker key already exists, then this means some other worker is renew_config
       -- Else, continue?
       local err = store_worker_config(plugin.config)
       if err then
-        kong.log.err("Could not place worker lock: " .. ngx.worker.id() .. " with error: " .. err)
+        kong.log.err(RENEW_LOG_PREFIX, "lock_failed worker=", ngx.worker.id(), " err=", err)
         return
       end
-      kong.log.info("Successfully placed worker lock: " .. ngx.worker.id())
+      kong.log.info(RENEW_LOG_PREFIX, "lock_ok worker=", ngx.worker.id())
 
       local x = ngx.time()
       renew_certificate_storage(plugin.config)
-      kong.log.info("Time take for renewal flow by worker " .. ngx.worker.id() .. " is " ..  ngx.time()-x)
+      kong.log.info(RENEW_LOG_PREFIX, "done worker=", ngx.worker.id(), " duration_s=", ngx.time()-x)
 
       --- Delete Renewal Worker Lock
       local err_del = delete_worker_config(plugin.config)
       if err_del then
-        kong.log.err("failed to delete worker_key lock for " .. ngx.worker.id() .. " with error:" .. err_del)
+        kong.log.err(RENEW_LOG_PREFIX, "unlock_failed worker=", ngx.worker.id(), " err=", err_del)
       else
-        kong.log.info("Successfully removed worker lock: " .. ngx.worker.id())
+        kong.log.info(RENEW_LOG_PREFIX, "unlock_ok worker=", ngx.worker.id())
       end
     end
   end

@@ -450,6 +450,12 @@ local function renew_certificate_storage(conf)
     kong.log.warn(RENEW_LOG_PREFIX, "can't set renew_last_run: ", err)
   end
 
+  local stale_cert_cleanup_days = conf.stale_cert_cleanup_days
+  local stale_cert_cleanup_threshold
+  if stale_cert_cleanup_days and stale_cert_cleanup_days > 0 then
+    stale_cert_cleanup_threshold = 86400 * stale_cert_cleanup_days
+  end
+
   for _, renew_conf_key in ipairs(renew_conf_keys) do
 
     local renew_conf, err = st:get(renew_conf_key)
@@ -475,6 +481,22 @@ local function renew_certificate_storage(conf)
     end
     if not renew_conf.expire_at then
       kong.log.warn(RENEW_LOG_PREFIX, "invalid renew conf expire_at host=", host)
+      goto renew_continue
+    end
+
+    -- If the cert has been expired for longer than configured threshold, delete it
+    -- and the renew config. The certificate phase will re-issue on a real request.
+    if stale_cert_cleanup_threshold and ngx.time() - renew_conf.expire_at > stale_cert_cleanup_threshold then
+      kong.log.info(RENEW_LOG_PREFIX, "skip host=", host,
+                    " reason=stale_expired_over_cleanup_threshold, cleaning up")
+      local err = delete_certificate_for_host(host)
+      if err then
+        kong.log.warn(RENEW_LOG_PREFIX, "cleanup failed for stale host=", host, " err=", err)
+      end
+      err = st:delete(renew_conf_key)
+      if err then
+        kong.log.warn(RENEW_LOG_PREFIX, "failed deleting stale renew conf key=", renew_conf_key, " err=", err)
+      end
       goto renew_continue
     end
 

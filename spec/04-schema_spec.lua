@@ -9,8 +9,33 @@ describe("Plugin: acme (schema)", function()
       input = {
         account_email = "example@example.com",
         api_uri = "https://api.acme.org",
+        stale_cert_cleanup_days = 180,
       },
       error = nil
+    },
+    ----------------------------------------
+    {
+      name = "accepts stale cleanup disabled",
+      input = {
+        account_email = "example@example.com",
+        api_uri = "https://api.acme.org",
+        stale_cert_cleanup_days = 0,
+      },
+      error = nil
+    },
+    ----------------------------------------
+    {
+      name = "rejects negative stale cleanup days",
+      input = {
+        account_email = "example@example.com",
+        api_uri = "https://api.acme.org",
+        stale_cert_cleanup_days = -1,
+      },
+      error = {
+        config = {
+          stale_cert_cleanup_days = "custom validation failed"
+        }
+      }
     },
     ----------------------------------------
     {

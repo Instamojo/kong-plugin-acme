@@ -76,6 +76,11 @@ local schema = {
           type = "number",
           default = 14,
         }, },
+        { stale_cert_cleanup_days = {
+          type = "number",
+          default = 180,
+          custom_validator = function(d) return d >= 0 end,
+        }, },
         { domains_in_db = {
           type = "boolean",
           default = false,

@@ -12,7 +12,7 @@ and serve dynamically. Renewal is handled with a configurable threshold time.
 - Kong needs to listen 80 port or proxied by a load balancer that listens for 80 port.
 - `lua_ssl_trusted_certificate` needs to be set in `kong.conf` to ensure the plugin can properly
 verify Let's Encrypt API. The CA-bundle file is usually `/etc/ssl/certs/ca-certificates.crt` for
-Ubuntu/Debian and `/etc/ssl/certs/ca-bundle.crt` for CentOS/Fedora/RHEL. If you are using Kong with Docker you can also 
+Ubuntu/Debian and `/etc/ssl/certs/ca-bundle.crt` for CentOS/Fedora/RHEL. If you are using Kong with Docker you can also
 set `KONG_LUA_SSL_TRUSTED_CERTIFICATE` as environment instead of changing `kong.conf`.
 
 #### Enable the Plugin
@@ -47,7 +47,7 @@ Note by setting `tos_accepted` to *true* implies that you have read and accepted
 [terms of service](https://letsencrypt.org/repository/).
 
 **This plugin can only be configured as a global plugin.** The plugin terminats
-`/.well-known/acme-challenge/` path for matching domains. To create certificate 
+`/.well-known/acme-challenge/` path for matching domains. To create certificate
 and terminates challenge only for certain domains, please refer to the
 [Plugin Config](#plugin-config) section.
 
@@ -95,6 +95,7 @@ config.api_uri      |            |  `"https://acme-v02.api.letsencrypt.org/direc
 config.cert_type    |            |  `"rsa"`   | The certificate type to create. The possible values are `"rsa"` for RSA certificate or `"ecc"` for EC certificate.
 config.domains      |            | `[]`       | The list of domains to create certificate for. To match subdomains under `example.com`, use `*.example.com`. Regex pattern is not supported. Note this config is only used to match domains, not to specify the Common Name or Subject Alternative Name to create certifcates; each domain will have its own certificate.
 config.renew_threshold_days|     |  `14`      | Days before expire to renew the certificate.
+config.stale_cert_cleanup_days|  |  `180`     | Delete certificate/SNI and renew config when the tracked certificate has been expired longer than this many days. Set to `0` to disable stale cleanup. A new cert is re-issued on-demand by the certificate phase when traffic returns.
 config.storage      |            |  `"shm"`   | The backend storage type to use. The possible values are `"kong"`, `"shm"`, `"redis"`, `"consul"`, or `"vault"`. In DB-less mode, `"kong"` storage is unavailable. Note that `"shm"` storage does not persist during Kong restarts and does not work for Kong running on different machines, so consider using one of `"kong"`, `"redis"`, `"consul"`, or `"vault"` in production.
 config.storage_config|           | (See below)| Storage configs for each backend storage.
 config.tos_accepted |            | `false`    | If you are using Let's Encrypt, you must set this to true to agree the [Terms of Service](https://letsencrypt.org/repository/).

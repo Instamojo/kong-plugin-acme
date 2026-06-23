@@ -2,7 +2,7 @@ package = "kong-plugin-acme"
 -- The version '0.0.1' is the source code version, the trailing '1' is the version of this rockspec.
 -- whenever the source version changes, the rockspec should be reset to 1. The rockspec version is only
 -- updated (incremented) when this file changes, but the source remains the same.
-version = "0.2.11-1"
+version = "0.2.12-1"
 source = {
    url = "git+https://github.com/Kong/kong-plugin-acme.git",
    tag = "0.2.10",
